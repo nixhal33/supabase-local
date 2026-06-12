@@ -1,0 +1,842 @@
+# =============================================================================
+# SUPABASE SELF-HOSTED — FULL STACK
+# Official source: https://github.com/supabase/supabase/tree/master/docker
+# Images current as of June 2026
+#
+# USAGE:
+#   Start:         docker compose up -d
+#   Start + wait:  docker compose up -d --wait
+#   Stop:          docker compose down
+#   Stop + wipe:   docker compose down -v   ← destroys ALL data volumes
+#   Logs:          docker compose logs -f <service>
+#   Status:        docker compose ps
+#
+# BEFORE RUNNING:
+#   1. Copy .env.example → .env
+#   2. Change POSTGRES_PASSWORD, JWT_SECRET, ANON_KEY, SERVICE_ROLE_KEY
+#   3. Set SITE_URL and SUPABASE_PUBLIC_URL to your domain
+#   4. Optionally configure SMTP_* for email auth
+#
+# STARTUP ORDER (enforced via depends_on + healthchecks):
+#   db → analytics → studio
+#   db → auth
+#   db → rest
+#   db → realtime
+#   db → rest → imgproxy → storage
+#   db → meta
+#   db → supavisor
+#   kong ← (waits for studio to be healthy)
+#   kong → functions
+#   vector (starts independently, ships logs to analytics)
+# =============================================================================
+
+name: supabase
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # STUDIO — The web dashboard (Next.js app)
+  # Access at: http://localhost:3000  (or KONG_HTTP_PORT for production)
+  #
+  # Studio does NOT talk directly to auth/rest/storage.
+  # It routes EVERYTHING through Kong at http://kong:8000.
+  # The only direct connection is to meta:8080 for DB introspection
+  # (table editor, schema visualizer, RLS policy builder).
+  # ---------------------------------------------------------------------------
+  studio:
+    container_name: supabase-studio
+    image: supabase/studio:2026.04.27-sha-5f60601
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://localhost:3000/api/platform/profile').then((r) => {if (r.status !== 200) throw new Error(r.status)})\""
+        ]
+      timeout: 10s
+      interval: 5s
+      retries: 3
+    # Studio needs analytics healthy first (for the Logs tab to work)
+    depends_on:
+      analytics:
+        condition: service_healthy
+    environment:
+      # Bind to all IPv4 interfaces inside the container
+      HOSTNAME: "0.0.0.0"
+
+      # postgres-meta endpoint for DB introspection (table editor, etc.)
+      STUDIO_PG_META_URL: http://meta:8080
+
+      # Direct DB connection info (used by Studio for some admin tasks)
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PG_META_CRYPTO_KEY: ${PG_META_CRYPTO_KEY}
+
+      # PostgREST config reflected in Studio UI
+      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS}
+      PGRST_DB_MAX_ROWS: ${PGRST_DB_MAX_ROWS:-1000}
+      PGRST_DB_EXTRA_SEARCH_PATH: ${PGRST_DB_EXTRA_SEARCH_PATH:-public}
+
+      # Dashboard project/org display name (cosmetic only)
+      DEFAULT_ORGANIZATION_NAME: ${STUDIO_DEFAULT_ORGANIZATION}
+      DEFAULT_PROJECT_NAME: ${STUDIO_DEFAULT_PROJECT}
+
+      # Optional: enables AI SQL assistant in Studio
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+
+      # Kong is Studio's API gateway — all /rest, /auth, /storage calls go here
+      SUPABASE_URL: http://kong:8000
+      # Public URL shown to users in the Studio UI (must be reachable from browser)
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL}
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+
+      # Analytics (Logflare) tokens — for the Logs Explorer tab in Studio
+      LOGFLARE_API_KEY: ${LOGFLARE_PUBLIC_ACCESS_TOKEN}
+      LOGFLARE_PUBLIC_ACCESS_TOKEN: ${LOGFLARE_PUBLIC_ACCESS_TOKEN}
+      LOGFLARE_PRIVATE_ACCESS_TOKEN: ${LOGFLARE_PRIVATE_ACCESS_TOKEN}
+      LOGFLARE_URL: http://analytics:4000
+      NEXT_PUBLIC_ENABLE_LOGS: "true"
+
+      # Use Postgres as analytics backend (default).
+      # Change to "bigquery" if you have a BigQuery project.
+      NEXT_ANALYTICS_BACKEND_PROVIDER: postgres
+
+      # Folder paths for SQL snippets and edge function code shown in Studio
+      SNIPPETS_MANAGEMENT_FOLDER: /app/snippets
+      EDGE_FUNCTIONS_MANAGEMENT_FOLDER: /app/edge-functions
+    volumes:
+      # Persist SQL snippets saved in Studio across container restarts
+      - ./volumes/snippets:/app/snippets:Z
+      # Edge function source files visible in Studio's Functions tab
+      - ./volumes/functions:/app/edge-functions:Z
+
+  # ---------------------------------------------------------------------------
+  # KONG — API Gateway (the single public entry point)
+  # Ports: 8000 (HTTP), 8443 (HTTPS)
+  #
+  # Kong reads ./volumes/api/kong.yml and routes:
+  #   /rest/v1/*       → rest:3000   (PostgREST)
+  #   /auth/v1/*       → auth:9999   (GoTrue)
+  #   /storage/v1/*    → storage:5000
+  #   /realtime/v1/*   → realtime:4000
+  #   /functions/v1/*  → functions:9000
+  #   /             → studio:3000 (dashboard)
+  #
+  # kong-entrypoint.sh runs envsubst on kong.yml before Kong starts,
+  # injecting ANON_KEY and SERVICE_KEY into the routing config.
+  # ---------------------------------------------------------------------------
+  kong:
+    container_name: supabase-kong
+    image: kong/kong:3.9.1
+    restart: unless-stopped
+    # Alias lets services inside Docker resolve Kong as "api-gw" too
+    networks:
+      default:
+        aliases:
+          - api-gw
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    # Kong starts after Studio because Studio configures some Kong routes
+    depends_on:
+      studio:
+        condition: service_healthy
+    ports:
+      # Expose Kong to the host. Your app/browser connects here.
+      - ${KONG_HTTP_PORT}:8000/tcp
+      - ${KONG_HTTPS_PORT}:8443/tcp
+    volumes:
+      # The routing config template. kong-entrypoint.sh injects env vars then writes
+      # the result to /usr/local/kong/kong.yml before Kong starts.
+      - ./volumes/api/kong.yml:/home/kong/temp.yml:ro,z
+      # Custom entrypoint that does env var substitution on kong.yml
+      - ./volumes/api/kong-entrypoint.sh:/home/kong/kong-entrypoint.sh:ro,z
+      # Uncomment these two lines to enable HTTPS with your own cert:
+      #- ./volumes/api/server.crt:/home/kong/server.crt:ro
+      #- ./volumes/api/server.key:/home/kong/server.key:ro
+    environment:
+      # Run Kong in DB-less (declarative config) mode — no separate Kong DB needed
+      KONG_DATABASE: "off"
+      # Path where kong-entrypoint.sh writes the final processed config
+      KONG_DECLARATIVE_CONFIG: /usr/local/kong/kong.yml
+      # DNS resolution order — important for Docker service discovery
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_DNS_NOT_FOUND_TTL: 1
+      # Plugins in use — do not remove any without checking kong.yml
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth,request-termination,ip-restriction,post-function
+      # Buffer sizes — increase if you get 502s with large request/response bodies
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+      KONG_PROXY_ACCESS_LOG: /dev/stdout combined
+      # Uncomment to enable TLS termination in Kong:
+      #KONG_SSL_CERT: /home/kong/server.crt
+      #KONG_SSL_CERT_KEY: /home/kong/server.key
+      # These keys are substituted into kong.yml by kong-entrypoint.sh
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      # New opaque API key format (leave empty if not using yet)
+      SUPABASE_PUBLISHABLE_KEY: ${SUPABASE_PUBLISHABLE_KEY:-}
+      SUPABASE_SECRET_KEY: ${SUPABASE_SECRET_KEY:-}
+      ANON_KEY_ASYMMETRIC: ${ANON_KEY_ASYMMETRIC:-}
+      SERVICE_ROLE_KEY_ASYMMETRIC: ${SERVICE_ROLE_KEY_ASYMMETRIC:-}
+      # Basic auth credentials for the Studio dashboard login prompt
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
+    entrypoint: /home/kong/kong-entrypoint.sh
+
+  # ---------------------------------------------------------------------------
+  # AUTH — GoTrue (authentication server)
+  # Internal port: 9999   Reachable via Kong at: /auth/v1/*
+  #
+  # Handles: email/password signup, magic links, OAuth (Google, GitHub, etc.),
+  # phone OTP, MFA (TOTP + phone), SAML SSO, and anonymous auth.
+  #
+  # Stores users in the auth.* schema inside Postgres.
+  # Connects as the dedicated role: supabase_auth_admin
+  # Issues JWTs signed with JWT_SECRET.
+  # ---------------------------------------------------------------------------
+  auth:
+    container_name: supabase-auth
+    image: supabase/gotrue:v2.186.0
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://localhost:9999/health"
+        ]
+      timeout: 5s
+      interval: 5s
+      retries: 3
+    # Disable db dependency if using an external Postgres
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      # This is the public URL of the Auth API — used in OAuth callbacks and email links
+      API_EXTERNAL_URL: ${API_EXTERNAL_URL}
+
+      GOTRUE_DB_DRIVER: postgres
+      # Connects as supabase_auth_admin (not postgres superuser)
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+
+      # Your frontend app URL — used as the default redirect after email confirmation
+      GOTRUE_SITE_URL: ${SITE_URL}
+      # Comma-separated additional allowed redirect URLs (e.g. for mobile apps)
+      GOTRUE_URI_ALLOW_LIST: ${ADDITIONAL_REDIRECT_URLS}
+      # Set to true to prevent new user signups (invite-only mode)
+      GOTRUE_DISABLE_SIGNUP: ${DISABLE_SIGNUP}
+
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      # Token expiry in seconds (default 3600 = 1 hour)
+      GOTRUE_JWT_EXP: ${JWT_EXPIRY}
+      # HS256 symmetric secret — must match JWT_SECRET used everywhere else
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+
+      # ── Email auth ──────────────────────────────────────────────────────────
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: ${ENABLE_EMAIL_SIGNUP}
+      GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: ${ENABLE_ANONYMOUS_USERS}
+      # Set to true in dev to skip the email verification step
+      GOTRUE_MAILER_AUTOCONFIRM: ${ENABLE_EMAIL_AUTOCONFIRM}
+
+      # SMTP credentials — configure your email provider here
+      # For dev: use a local mail catcher like Mailpit or Inbucket
+      GOTRUE_SMTP_ADMIN_EMAIL: ${SMTP_ADMIN_EMAIL}
+      GOTRUE_SMTP_HOST: ${SMTP_HOST}
+      GOTRUE_SMTP_PORT: ${SMTP_PORT}
+      GOTRUE_SMTP_USER: ${SMTP_USER}
+      GOTRUE_SMTP_PASS: ${SMTP_PASS}
+      GOTRUE_SMTP_SENDER_NAME: ${SMTP_SENDER_NAME}
+
+      # Paths appended to SUPABASE_PUBLIC_URL in email links
+      GOTRUE_MAILER_URLPATHS_INVITE: ${MAILER_URLPATHS_INVITE}
+      GOTRUE_MAILER_URLPATHS_CONFIRMATION: ${MAILER_URLPATHS_CONFIRMATION}
+      GOTRUE_MAILER_URLPATHS_RECOVERY: ${MAILER_URLPATHS_RECOVERY}
+      GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: ${MAILER_URLPATHS_EMAIL_CHANGE}
+
+      # ── Phone / SMS auth ────────────────────────────────────────────────────
+      GOTRUE_EXTERNAL_PHONE_ENABLED: ${ENABLE_PHONE_SIGNUP}
+      GOTRUE_SMS_AUTOCONFIRM: ${ENABLE_PHONE_AUTOCONFIRM}
+
+      # ── OAuth providers ─────────────────────────────────────────────────────
+      # Uncomment the providers you want. Also uncomment matching .env vars.
+      # GOTRUE_EXTERNAL_GOOGLE_ENABLED: ${GOOGLE_ENABLED}
+      # GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      # GOTRUE_EXTERNAL_GOOGLE_SECRET: ${GOOGLE_SECRET}
+      # GOTRUE_EXTERNAL_GOOGLE_REDIRECT_URI: ${API_EXTERNAL_URL}/auth/v1/callback
+
+      # GOTRUE_EXTERNAL_GITHUB_ENABLED: ${GITHUB_ENABLED}
+      # GOTRUE_EXTERNAL_GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID}
+      # GOTRUE_EXTERNAL_GITHUB_SECRET: ${GITHUB_SECRET}
+      # GOTRUE_EXTERNAL_GITHUB_REDIRECT_URI: ${API_EXTERNAL_URL}/auth/v1/callback
+
+      # GOTRUE_EXTERNAL_AZURE_ENABLED: ${AZURE_ENABLED}
+      # GOTRUE_EXTERNAL_AZURE_CLIENT_ID: ${AZURE_CLIENT_ID}
+      # GOTRUE_EXTERNAL_AZURE_SECRET: ${AZURE_SECRET}
+      # GOTRUE_EXTERNAL_AZURE_REDIRECT_URI: ${API_EXTERNAL_URL}/auth/v1/callback
+
+      # ── SMS provider (Twilio) ───────────────────────────────────────────────
+      # Uncomment to enable phone auth / SMS OTP
+      # GOTRUE_SMS_PROVIDER: ${SMS_PROVIDER}
+      # GOTRUE_SMS_TWILIO_ACCOUNT_SID: ${SMS_TWILIO_ACCOUNT_SID}
+      # GOTRUE_SMS_TWILIO_AUTH_TOKEN: ${SMS_TWILIO_AUTH_TOKEN}
+      # GOTRUE_SMS_TWILIO_MESSAGE_SERVICE_SID: ${SMS_TWILIO_MESSAGE_SERVICE_SID}
+
+      # ── MFA ─────────────────────────────────────────────────────────────────
+      # GOTRUE_MFA_TOTP_ENROLL_ENABLED: ${MFA_TOTP_ENROLL_ENABLED}
+      # GOTRUE_MFA_TOTP_VERIFY_ENABLED: ${MFA_TOTP_VERIFY_ENABLED}
+      # GOTRUE_MFA_PHONE_ENROLL_ENABLED: ${MFA_PHONE_ENROLL_ENABLED}
+      # GOTRUE_MFA_PHONE_VERIFY_ENABLED: ${MFA_PHONE_VERIFY_ENABLED}
+      # GOTRUE_MFA_MAX_ENROLLED_FACTORS: ${MFA_MAX_ENROLLED_FACTORS}
+
+      # ── SAML SSO ─────────────────────────────────────────────────────────────
+      # GOTRUE_SAML_ENABLED: ${SAML_ENABLED}
+      # GOTRUE_SAML_PRIVATE_KEY: ${SAML_PRIVATE_KEY}
+      # GOTRUE_SAML_EXTERNAL_URL: ${SAML_EXTERNAL_URL}
+
+      # ── Auth Hooks (custom Postgres functions) ──────────────────────────────
+      # GOTRUE_HOOK_CUSTOM_ACCESS_TOKEN_ENABLED: "true"
+      # GOTRUE_HOOK_CUSTOM_ACCESS_TOKEN_URI: "pg-functions://postgres/public/custom_access_token_hook"
+      # GOTRUE_HOOK_CUSTOM_ACCESS_TOKEN_SECRETS: "<base64-secret>"
+      # GOTRUE_HOOK_SEND_EMAIL_ENABLED: "false"
+      # GOTRUE_HOOK_SEND_EMAIL_URI: "http://host.docker.internal:54321/functions/v1/email_sender"
+
+  # ---------------------------------------------------------------------------
+  # REST — PostgREST (auto-generated REST API)
+  # Internal port: 3000   Reachable via Kong at: /rest/v1/*
+  #
+  # Reads your Postgres schema and auto-generates REST endpoints for every
+  # table and view. RLS is enforced: PostgREST connects as 'authenticator'
+  # then switches to the role in the JWT (anon / authenticated / service_role)
+  # using SET LOCAL ROLE before running the query.
+  # ---------------------------------------------------------------------------
+  rest:
+    container_name: supabase-rest
+    image: postgrest/postgrest:v14.8
+    restart: unless-stopped
+    # Disable db dependency if using an external Postgres
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Connects as 'authenticator' — a low-privilege Postgres role that can
+      # switch to anon / authenticated / service_role dynamically per request
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+      # Comma-separated Postgres schemas to expose via the API
+      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS}
+      # Max rows returned per request (protects against runaway queries)
+      PGRST_DB_MAX_ROWS: ${PGRST_DB_MAX_ROWS:-1000}
+      # Extra schemas added to every request's search_path
+      PGRST_DB_EXTRA_SEARCH_PATH: ${PGRST_DB_EXTRA_SEARCH_PATH:-public}
+      # Role used for unauthenticated requests (no JWT or expired JWT)
+      PGRST_DB_ANON_ROLE: anon
+      # JWT verification secret — must match JWT_SECRET (or JWKS for ES256)
+      PGRST_JWT_SECRET: ${JWT_JWKS:-${JWT_SECRET}}
+      # Use session variables instead of legacy GUCs (required for RLS to work correctly)
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      # These become app.settings.jwt_secret and app.settings.jwt_exp in SQL
+      # Useful for RLS policies that reference auth settings
+      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: ${JWT_EXPIRY}
+    command: ["postgrest"]
+
+  # ---------------------------------------------------------------------------
+  # REALTIME — WebSocket server (Elixir/Phoenix)
+  # Internal port: 4000   Reachable via Kong at: /realtime/v1/*
+  #
+  # Listens to Postgres WAL (logical replication) and broadcasts row-level
+  # changes to subscribed WebSocket clients. Also handles Presence (who's
+  # online) and Broadcast (arbitrary pub/sub channels).
+  #
+  # REPLICATION_MODE is now always RLS — per-user row-level security is
+  # enforced based on the JWT in the WebSocket connection.
+  # ---------------------------------------------------------------------------
+  realtime:
+    # Container name must follow this pattern — Realtime parses its own
+    # tenant ID from the subdomain part of the container name
+    container_name: realtime-dev.supabase-realtime
+    image: supabase/realtime:v2.76.5
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sSfL --head -o /dev/null -H \"Authorization: Bearer ${ANON_KEY}\" http://localhost:4000/api/tenants/realtime-dev/health"
+        ]
+      timeout: 5s
+      interval: 30s
+      retries: 3
+      start_period: 10s
+    environment:
+      PORT: 4000
+      DB_HOST: ${POSTGRES_HOST}
+      DB_PORT: ${POSTGRES_PORT}
+      DB_USER: supabase_admin
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+      # Switch to the _realtime schema immediately on connect
+      DB_AFTER_CONNECT_QUERY: 'SET search_path TO _realtime'
+      DB_ENC_KEY: supabaserealtime
+      # JWT secret for verifying WebSocket connection tokens
+      API_JWT_SECRET: ${JWT_SECRET}
+      # Elixir/Phoenix secret key — generate a random 64+ char string
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      METRICS_JWT_SECRET: ${JWT_SECRET}
+      ERL_AFLAGS: -proto_dist inet_tcp
+      DNS_NODES: "''"
+      RLIMIT_NOFILE: "10000"
+      APP_NAME: realtime
+      # Automatically seeds tenant config on startup (for self-hosted)
+      SEED_SELF_HOST: "true"
+      RUN_JANITOR: "true"
+      # Suppress noisy healthcheck log lines
+      DISABLE_HEALTHCHECK_LOGGING: "true"
+
+  # ---------------------------------------------------------------------------
+  # STORAGE — File storage API
+  # Internal port: 5000   Reachable via Kong at: /storage/v1/*
+  #
+  # Manages buckets and objects. By default stores files on local disk
+  # (in the ./volumes/storage volume). Can be switched to S3-compatible
+  # storage by using: docker compose -f docker-compose.yml -f docker-compose.s3.yml up
+  #
+  # File metadata (bucket names, object paths, sizes, owners) is stored
+  # in the storage.* schema inside Postgres.
+  # RLS policies on storage.objects control per-user file access.
+  # ---------------------------------------------------------------------------
+  storage:
+    container_name: supabase-storage
+    image: supabase/storage-api:v1.48.26
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      rest:
+        condition: service_started
+      imgproxy:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://storage:5000/status"
+        ]
+      timeout: 5s
+      interval: 5s
+      retries: 3
+      start_period: 10s
+    environment:
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      # Storage calls PostgREST to store file metadata — keeps everything in Postgres
+      POSTGREST_URL: http://rest:3000
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      # Connects as supabase_storage_admin (not superuser)
+      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+      # Public URL used in signed URLs and download links
+      STORAGE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL}
+      REQUEST_ALLOW_X_FORWARDED_PATH: "true"
+      # Max upload size in bytes (default: 50MB = 52428800)
+      FILE_SIZE_LIMIT: 52428800
+      # 'file' = local disk   |   's3' = S3-compatible (use docker-compose.s3.yml)
+      STORAGE_BACKEND: file
+      # When STORAGE_BACKEND=file, this is the directory name inside the volume
+      GLOBAL_S3_BUCKET: ${GLOBAL_S3_BUCKET}
+      # S3 backend config — only needed when STORAGE_BACKEND=s3
+      #GLOBAL_S3_ENDPOINT: https://your-s3-endpoint
+      #GLOBAL_S3_PROTOCOL: https
+      #GLOBAL_S3_FORCE_PATH_STYLE: "true"
+      #AWS_ACCESS_KEY_ID: your-access-key-id
+      #AWS_SECRET_ACCESS_KEY: your-secret-access-key
+      # Path inside container where files are written (matches volume mount)
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      TENANT_ID: ${STORAGE_TENANT_ID}
+      REGION: ${REGION}
+      # Enable image transformation API (resize, crop, format convert)
+      ENABLE_IMAGE_TRANSFORMATION: "true"
+      # imgproxy handles the actual image transforms
+      IMGPROXY_URL: http://imgproxy:5001
+      # S3 protocol endpoint credentials (for SDK-compatible S3 access to Storage)
+      S3_PROTOCOL_ACCESS_KEY_ID: ${S3_PROTOCOL_ACCESS_KEY_ID}
+      S3_PROTOCOL_ACCESS_KEY_SECRET: ${S3_PROTOCOL_ACCESS_KEY_SECRET}
+    volumes:
+      # Persistent volume for uploaded files — DO NOT delete this in production
+      - ./volumes/storage:/var/lib/storage:z
+
+  # ---------------------------------------------------------------------------
+  # IMGPROXY — Image transformation server (Go binary)
+  # Internal port: 5001   Called internally by Storage only
+  #
+  # Not directly accessible from outside. Storage redirects image transform
+  # requests (resize, crop, format conversion) here. imgproxy reads from the
+  # same ./volumes/storage volume that Storage writes to.
+  # ---------------------------------------------------------------------------
+  imgproxy:
+    container_name: supabase-imgproxy
+    image: darthsim/imgproxy:v3.30.1
+    restart: unless-stopped
+    volumes:
+      # Shares the same storage volume so imgproxy can read uploaded files
+      - ./volumes/storage:/var/lib/storage:z
+    healthcheck:
+      test: ["CMD", "imgproxy", "health"]
+      timeout: 5s
+      interval: 5s
+      retries: 3
+    environment:
+      IMGPROXY_BIND: ":5001"
+      # Root path for local file access — set to / so it can reach /var/lib/storage
+      IMGPROXY_LOCAL_FILESYSTEM_ROOT: /
+      # Cache-busting via ETag headers
+      IMGPROXY_USE_ETAG: "true"
+      # Automatically serve WebP to browsers that support it
+      IMGPROXY_AUTO_WEBP: ${IMGPROXY_AUTO_WEBP}
+      # Max source image resolution in megapixels (16.8 MP default)
+      IMGPROXY_MAX_SRC_RESOLUTION: 16.8
+
+  # ---------------------------------------------------------------------------
+  # META — postgres-meta (DB introspection REST API)
+  # Internal port: 8080   Called by Studio only
+  #
+  # Studio uses this to list tables, columns, foreign keys, indexes, RLS
+  # policies, extensions, and roles. Your application never calls it.
+  # If you're running Supabase without Studio, you can remove this service.
+  # ---------------------------------------------------------------------------
+  meta:
+    container_name: supabase-meta
+    image: supabase/postgres-meta:v0.96.3
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PG_META_PORT: 8080
+      PG_META_DB_HOST: ${POSTGRES_HOST}
+      PG_META_DB_PORT: ${POSTGRES_PORT}
+      PG_META_DB_NAME: ${POSTGRES_DB}
+      # Connects as supabase_admin (superuser-equivalent) to read pg_catalog
+      PG_META_DB_USER: supabase_admin
+      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      # Key used to encrypt sensitive metadata (e.g. connection string display)
+      CRYPTO_KEY: ${PG_META_CRYPTO_KEY}
+
+  # ---------------------------------------------------------------------------
+  # FUNCTIONS — Edge Runtime (Deno-based serverless functions)
+  # Internal port: 9000   Reachable via Kong at: /functions/v1/*
+  #
+  # Each subfolder under ./volumes/functions/ is one function.
+  # Functions call your own Supabase stack via Kong (http://kong:8000).
+  # VERIFY_JWT=false disables per-function JWT auth — set to true in production.
+  # ---------------------------------------------------------------------------
+  functions:
+    container_name: supabase-edge-functions
+    image: supabase/edge-runtime:v1.71.2
+    restart: unless-stopped
+    volumes:
+      # Your function code — each subdirectory = one function endpoint
+      - ./volumes/functions:/home/deno/functions:Z
+      # Persist Deno module cache between restarts (avoids re-downloading deps)
+      - deno-cache:/root/.cache/deno
+    # Functions need Kong healthy so they can call back into the Supabase API
+    depends_on:
+      kong:
+        condition: service_healthy
+    environment:
+      JWT_SECRET: ${JWT_SECRET}
+      # When a function calls createClient(), this is the URL it connects to
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL}
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      # New opaque key format (leave empty unless you've generated these)
+      SUPABASE_PUBLISHABLE_KEYS: "{\"default\":\"${SUPABASE_PUBLISHABLE_KEY:-}\"}"
+      SUPABASE_SECRET_KEYS: "{\"default\":\"${SUPABASE_SECRET_KEY:-}\"}"
+      # Direct DB URL — use this in functions that need a direct Postgres connection
+      SUPABASE_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+      # Set to "true" in production to require a valid JWT for every function call
+      VERIFY_JWT: "${FUNCTIONS_VERIFY_JWT}"
+    command:
+      [
+        "start",
+        "--main-service",
+        "/home/deno/functions/main"
+      ]
+
+  # ---------------------------------------------------------------------------
+  # ANALYTICS — Logflare (log aggregation and querying)
+  # Internal port: 4000   NOT exposed publicly
+  #
+  # Collects logs from all services (via Vector) and stores them in the
+  # _analytics schema inside Postgres. Studio's "Logs" tab queries this.
+  # Uses Postgres as backend by default (no BigQuery required).
+  # ---------------------------------------------------------------------------
+  analytics:
+    container_name: supabase-analytics
+    image: supabase/logflare:1.36.1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "http://localhost:4000/health"]
+      timeout: 5s
+      interval: 5s
+      retries: 10
+    # ports:
+    #   - 4000:4000   # Uncomment ONLY if you need direct external access to Logflare
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      LOGFLARE_NODE_HOST: 127.0.0.1
+      # Connects to the _supabase internal database (not 'postgres')
+      DB_USERNAME: supabase_admin
+      DB_DATABASE: _supabase
+      DB_HOSTNAME: ${POSTGRES_HOST}
+      DB_PORT: ${POSTGRES_PORT}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_SCHEMA: _analytics
+      # Access tokens for log ingestion (Vector → Logflare) and querying (Studio → Logflare)
+      LOGFLARE_PUBLIC_ACCESS_TOKEN: ${LOGFLARE_PUBLIC_ACCESS_TOKEN}
+      LOGFLARE_PRIVATE_ACCESS_TOKEN: ${LOGFLARE_PRIVATE_ACCESS_TOKEN}
+      LOGFLARE_SINGLE_TENANT: "true"
+      LOGFLARE_SUPABASE_MODE: "true"
+      # Postgres backend for analytics (comment these out to use BigQuery instead)
+      POSTGRES_BACKEND_URL: postgresql://supabase_admin:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/_supabase
+      POSTGRES_BACKEND_SCHEMA: _analytics
+      LOGFLARE_FEATURE_FLAG_OVERRIDE: multibackend=true
+      # BigQuery backend — uncomment if using Google BigQuery
+      # GOOGLE_PROJECT_ID: ${GOOGLE_PROJECT_ID}
+      # GOOGLE_PROJECT_NUMBER: ${GOOGLE_PROJECT_NUMBER}
+
+  # ---------------------------------------------------------------------------
+  # DB — Postgres (the foundation of everything)
+  # Port: 5432 (but connect via Supavisor in production, not directly)
+  #
+  # This is supabase/postgres — a customized image with:
+  #   - Extensions: pgvector, pg_cron, pgsodium, pg_net, pg_graphql, pgmq, etc.
+  #   - Internal schemas: auth.*, storage.*, _realtime.*, _analytics.*, graphql.*
+  #   - wal_level=logical (required for Realtime)
+  #   - pgsodium (Vault encryption key management)
+  #
+  # Init SQL files in ./volumes/db/ run ONCE on first container start:
+  #   realtime.sql   — creates _realtime schema for Realtime service
+  #   webhooks.sql   — sets up supabase_functions hooks
+  #   roles.sql      — configures Postgres roles (anon, authenticated, etc.)
+  #   jwt.sql        — stores JWT_SECRET in Postgres for use in RLS policies
+  #   _supabase.sql  — creates _supabase internal DB for analytics/pooler
+  #   logs.sql       — creates _analytics schema for Logflare
+  #   pooler.sql     — creates schema needed by Supavisor
+  # ---------------------------------------------------------------------------
+  db:
+    container_name: supabase-db
+    image: supabase/postgres:15.8.1.085
+    restart: unless-stopped
+    volumes:
+      # Init migrations — run in alphabetical order on first start (number prefix matters)
+      - ./volumes/db/realtime.sql:/docker-entrypoint-initdb.d/migrations/99-realtime.sql:Z
+      - ./volumes/db/_supabase.sql:/docker-entrypoint-initdb.d/migrations/97-_supabase.sql:Z
+      - ./volumes/db/logs.sql:/docker-entrypoint-initdb.d/migrations/99-logs.sql:Z
+      - ./volumes/db/pooler.sql:/docker-entrypoint-initdb.d/migrations/99-pooler.sql:Z
+      # Init scripts — run after migrations
+      - ./volumes/db/webhooks.sql:/docker-entrypoint-initdb.d/init-scripts/98-webhooks.sql:Z
+      - ./volumes/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:Z
+      - ./volumes/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:Z
+      # Persistent data volume — this is your actual database. NEVER delete this.
+      - ./volumes/db/data:/var/lib/postgresql/data:Z
+      # Named volume for pgsodium key — survives container recreation
+      - db-config:/etc/postgresql-custom
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "pg_isready",
+          "-U",
+          "postgres",
+          "-h",
+          "localhost"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    environment:
+      # Unix socket path — services that connect via TCP use POSTGRES_HOST=db instead
+      POSTGRES_HOST: /var/run/postgresql
+      PGPORT: ${POSTGRES_PORT}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # JWT_SECRET is injected into Postgres via jwt.sql init script
+      # so RLS policies can call auth.jwt() to verify tokens
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXP: ${JWT_EXPIRY}
+    command:
+      [
+        "postgres",
+        "-c", "config_file=/etc/postgresql/postgresql.conf",
+        # Suppress Realtime's frequent polling queries from cluttering logs
+        "-c", "log_min_messages=fatal"
+      ]
+
+  # ---------------------------------------------------------------------------
+  # VECTOR — Log collector (ships container logs to Logflare/analytics)
+  #
+  # Reads Docker container logs via the Docker socket and forwards them
+  # to the analytics (Logflare) service. This powers the Logs Explorer
+  # in Studio where you can query logs from all services.
+  #
+  # If you don't need the Logs Explorer, you can remove this service
+  # and the analytics service to save resources.
+  # ---------------------------------------------------------------------------
+  vector:
+    container_name: supabase-vector
+    image: timberio/vector:0.53.0-alpine
+    restart: unless-stopped
+    volumes:
+      # Vector configuration — defines sources (Docker logs) and sinks (Logflare)
+      - ./volumes/logs/vector.yml:/etc/vector/vector.yml:ro,z
+      # Docker socket — needed to read container stdout/stderr logs
+      # For rootless Docker, change this to: /run/user/1000/docker.sock
+      - ${DOCKER_SOCKET_LOCATION}:/var/run/docker.sock:ro,z
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://vector:9001/health"
+        ]
+      timeout: 5s
+      interval: 5s
+      retries: 3
+    environment:
+      # Auth token Vector uses when forwarding logs to Logflare
+      LOGFLARE_PUBLIC_ACCESS_TOKEN: ${LOGFLARE_PUBLIC_ACCESS_TOKEN}
+    command: ["--config", "/etc/vector/vector.yml"]
+    # Required to access the Docker socket on SELinux systems
+    security_opt:
+      - "label=disable"
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: supabase-mailhog
+    ports:
+      - "8025:8025"  # Web UI
+      - "1025:1025"  # SMTP port
+    networks:
+      - supabase
+    restart: unless-stopped
+  
+  # ---------------------------------------------------------------------------
+  # SUPAVISOR — Postgres connection pooler (Elixir)
+  # Ports:
+  #   5432 → session mode    (persistent connection, suitable for migrations)
+  #   6543 → transaction mode (connection released after each transaction,
+  #                            use this in production APIs — supports 10k+ clients)
+  #
+  # Without a pooler, every app connection opens a Postgres backend process.
+  # Postgres has a hard limit (~100-200 by default). Supavisor maintains a
+  # small pool to Postgres and multiplexes thousands of app connections through it.
+  #
+  # Connect your app using:
+  #   Session mode:     postgres://postgres:<password>@<host>:5432/postgres
+  #   Transaction mode: postgres://postgres.<tenant-id>:<password>@<host>:6543/postgres
+  # ---------------------------------------------------------------------------
+  supavisor:
+    container_name: supabase-pooler
+    image: supabase/supavisor:2.7.4
+    restart: unless-stopped
+    ports:
+      # Session mode — use for schema migrations and long-running connections
+      - ${POSTGRES_PORT}:5432
+      # Transaction mode — use for stateless API servers and serverless functions
+      - ${POOLER_PROXY_PORT_TRANSACTION}:6543
+    volumes:
+      # Runtime config for tenant setup — defines pool sizes and DB credentials
+      - ./volumes/pooler/pooler.exs:/etc/pooler/pooler.exs:ro,z
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-sSfL",
+          "--head",
+          "-o",
+          "/dev/null",
+          "http://127.0.0.1:4000/api/health"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: 4000
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Connects to the _supabase internal database for pooler metadata
+      DATABASE_URL: ecto://supabase_admin:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/_supabase
+      CLUSTER_POSTGRES: "true"
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      # Encryption key for credentials stored in Vault (min 32 chars)
+      VAULT_ENC_KEY: ${VAULT_ENC_KEY}
+      API_JWT_SECRET: ${JWT_SECRET}
+      METRICS_JWT_SECRET: ${JWT_SECRET}
+      REGION: local
+      ERL_AFLAGS: -proto_dist inet_tcp
+      # Tenant ID used in transaction mode connection strings
+      POOLER_TENANT_ID: ${POOLER_TENANT_ID}
+      # How many Postgres connections to keep open in the pool
+      POOLER_DEFAULT_POOL_SIZE: ${POOLER_DEFAULT_POOL_SIZE}
+      # Max concurrent client connections Supavisor will accept
+      POOLER_MAX_CLIENT_CONN: ${POOLER_MAX_CLIENT_CONN}
+      POOLER_POOL_MODE: transaction
+      DB_POOL_SIZE: ${POOLER_DB_POOL_SIZE}
+    command:
+      [
+        "/bin/sh",
+        "-c",
+        # 1. Run DB migrations for Supavisor's own schema
+        # 2. Load tenant configuration from pooler.exs
+        # 3. Start the Supavisor server
+        "/app/bin/migrate && /app/bin/supavisor eval \"$$(cat /etc/pooler/pooler.exs)\" && /app/bin/server"
+      ]
+
+# =============================================================================
+# VOLUMES — Named Docker volumes (persist data across container restarts)
+# =============================================================================
+volumes:
+  # pgsodium decryption key for Vault — survives container recreation
+  db-config:
+  # Deno module cache — avoids re-downloading npm/esm packages on restart
+  deno-cache:
+  
+networks:
+  supabase:
+    name: supabase
+    driver: bridge

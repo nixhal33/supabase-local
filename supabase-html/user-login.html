@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>User Login Test</title>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            padding: 20px; 
+            max-width: 500px; 
+            margin: 0 auto; 
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h2 { color: #333; margin-top: 0; }
+        input { 
+            width: 100%; 
+            padding: 10px; 
+            margin: 10px 0; 
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            box-sizing: border-box;
+        }
+        button { 
+            width: 100%; 
+            padding: 10px; 
+            background: #24a0ed; 
+            color: white; 
+            border: none; 
+            border-radius: 5px;
+            cursor: pointer; 
+            font-size: 16px;
+        }
+        button:hover { background: #1b80c2; }
+        pre { 
+            background: #f0f0f0; 
+            padding: 10px; 
+            overflow-x: auto; 
+            border-radius: 5px;
+            font-size: 12px;
+        }
+        .success { color: green; }
+        .error { color: red; }
+        .info { 
+            background: #e3f2fd; 
+            padding: 10px; 
+            border-radius: 5px; 
+            margin-top: 20px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>🔐 User Login to Your App</h2>
+        <p>Login as a regular user (not admin)</p>
+        
+        <input type="email" id="email" placeholder="Email" value="nischal.koirala33@gmail.com">
+        <input type="password" id="password" placeholder="Password" value="nischalkoirala33">
+        <button onclick="login()">Login</button>
+        
+        <div id="result"></div>
+        <div id="config-info" class="info"></div>
+    </div>
+
+    <script>
+        // ============================================
+        // CONFIGURATION - CHANGE THESE VALUES
+        // ============================================
+        
+        // Replace with your computer's IP address
+        // Find it using: ip addr show | grep inet | grep -v 127.0.0.1
+        const YOUR_COMPUTER_IP = '192.168.20.14';  // ← CHANGE THIS
+        
+        // Get your anon key from .env file
+        // Run: grep ANON_KEY ~/github_repos/supabase-local/.env | cut -d '=' -f2
+        const ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzgxMjUzNTc4LCJleHAiOjE4MTI3ODk1Nzh9.3C0XYDbEcahqzrZfXW8uCSezN4IQkFzmwsb-48xvRR8';  // ← CHANGE THIS
+        
+        // ============================================
+        // DO NOT EDIT BELOW THIS LINE
+        // ============================================
+        
+        const SUPABASE_URL = `http://${YOUR_COMPUTER_IP}:8000`;
+        
+        // Show config info
+        document.getElementById('config-info').innerHTML = `
+            <strong>📍 Connecting to:</strong> ${SUPABASE_URL}<br>
+            <strong>🔑 Using anon key:</strong> ${ANON_KEY.substring(0, 20)}...
+        `;
+
+        async function login() {
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            
+            // Validate inputs
+            if (!email || !password) {
+                document.getElementById('result').innerHTML = `
+                    <div class="error">❌ Please enter email and password</div>
+                `;
+                return;
+            }
+            
+            // Show loading
+            document.getElementById('result').innerHTML = '<p>🔄 Logging in...</p>';
+            
+            try {
+                const response = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+                    method: 'POST',
+                    headers: {
+                        'apikey': ANON_KEY,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ 
+                        email: email, 
+                        password: password 
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    document.getElementById('result').innerHTML = `
+                        <div class="success">
+                            <h3>✅ Login Successful!</h3>
+                            <p><strong>User ID:</strong> ${data.user.id}</p>
+                            <p><strong>Email:</strong> ${data.user.email}</p>
+                            <p><strong>Created At:</strong> ${new Date(data.user.created_at).toLocaleString()}</p>
+                            <hr>
+                            <p><strong>Access Token (first 100 chars):</strong></p>
+                            <pre>${data.access_token.substring(0, 100)}...</pre>
+                            <p><strong>Use this token in API requests:</strong></p>
+                            <pre>Authorization: Bearer ${data.access_token.substring(0, 50)}...</pre>
+                        </div>
+                    `;
+                } else {
+                    document.getElementById('result').innerHTML = `
+                        <div class="error">
+                            <h3>❌ Login Failed</h3>
+                            <p><strong>Error:</strong> ${data.msg || data.message || 'Invalid credentials'}</p>
+                            <p>Make sure:</p>
+                            <ul>
+                                <li>The user exists in Supabase</li>
+                                <li>The password is correct</li>
+                                <li>Email confirmation is disabled (ENABLE_EMAIL_AUTOCONFIRM=true)</li>
+                            </ul>
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                document.getElementById('result').innerHTML = `
+                    <div class="error">
+                        <h3>❌ Connection Error</h3>
+                        <p>${error.message}</p>
+                        <p>Make sure:</p>
+                        <ul>
+                            <li>Supabase is running: <code>docker ps | grep supabase</code></li>
+                            <li>Your IP address is correct</li>
+                            <li>Your phone/mobile is on the same WiFi network</li>
+                            <li>Port 8000 is accessible</li>
+                        </ul>
+                    </div>
+                `;
+            }
+        }
+    </script>
+</body>
+</html>
