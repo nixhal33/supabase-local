@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>My App - Login</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        .container {
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.2);
+            width: 400px;
+            padding: 40px;
+        }
+        h2 {
+            text-align: center;
+            margin-bottom: 30px;
+            color: #333;
+        }
+        input {
+            width: 100%;
+            padding: 12px;
+            margin: 10px 0;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        button:hover {
+            background: #5a67d8;
+        }
+        .message {
+            margin-top: 15px;
+            padding: 10px;
+            border-radius: 5px;
+            text-align: center;
+        }
+        .error {
+            background: #fed7d7;
+            color: #c53030;
+        }
+        .success {
+            background: #c6f6d5;
+            color: #22543d;
+        }
+        .info {
+            background: #e3f2fd;
+            color: #1e40af;
+            font-size: 14px;
+            margin-top: 20px;
+            padding: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>🔐 Welcome to My App</h2>
+        
+        <div id="loginForm">
+            <input type="email" id="email" placeholder="Your Email Address">
+            <input type="password" id="password" placeholder="Your Password">
+            <button onclick="login()">Login to Your Account</button>
+            <div id="message"></div>
+        </div>
+        
+        <div id="dashboard" style="display:none;">
+            <div id="dashboardContent"></div>
+            <button onclick="logout()">Logout</button>
+        </div>
+        
+        <div class="info">
+            <strong>ℹ️ Demo Users:</strong><br>
+            nischal.koirala33@gmail.com<br>
+            nix23@gmail.com<br>
+            otc1@gmail.com<br>
+            prabhu.chitrakar@techhaus.dev<br>
+            <em>(Use the passwords you set when creating them)</em>
+        </div>
+    </div>
+
+    <script>
+        // ========================================
+        // CONFIGURE THESE WITH YOUR VALUES
+        // ========================================
+        const SUPABASE_URL = 'http://192.168.1.24:8000';  // ← YOUR PC's IP
+        const ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzgxMjUzNTc4LCJleHAiOjE4MTI3ODk1Nzh9.3C0XYDbEcahqzrZfXW8uCSezN4IQkFzmwsb-48xvRR8';            // ← YOUR ANON KEY
+        // ========================================
+        
+        async function login() {
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            const messageDiv = document.getElementById('message');
+            
+            if (!email || !password) {
+                messageDiv.innerHTML = '<div class="message error">Please enter email and password</div>';
+                return;
+            }
+            
+            messageDiv.innerHTML = '<div class="message info">Logging in...</div>';
+            
+            try {
+                const response = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+                    method: 'POST',
+                    headers: {
+                        'apikey': ANON_KEY,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ email, password })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    // Save user session
+                    localStorage.setItem('access_token', data.access_token);
+                    localStorage.setItem('user_email', data.user.email);
+                    localStorage.setItem('user_id', data.user.id);
+                    
+                    showDashboard(data.user);
+                } else {
+                    messageDiv.innerHTML = `<div class="message error">Login failed: ${data.msg || 'Invalid email or password'}</div>`;
+                }
+            } catch (error) {
+                messageDiv.innerHTML = `<div class="message error">Connection error: ${error.message}</div>`;
+            }
+        }
+        
+        function showDashboard(user) {
+            document.getElementById('loginForm').style.display = 'none';
+            document.getElementById('dashboard').style.display = 'block';
+            
+            document.getElementById('dashboardContent').innerHTML = `
+                <h2>👋 Welcome, ${user.email}!</h2>
+                <div style="margin: 20px 0; padding: 20px; background: #f7fafc; border-radius: 5px;">
+                    <p><strong>User Dashboard</strong></p>
+                    <p>User ID: ${user.id}</p>
+                    <p>Account created: ${new Date(user.created_at).toLocaleString()}</p>
+                    <hr style="margin: 15px 0;">
+                    <p><strong>Your Profile:</strong></p>
+                    <p>Email: ${user.email}</p>
+                    <p>Last sign in: ${user.last_sign_in_at ? new Date(user.last_sign_in_at).toLocaleString() : 'First time'}</p>
+                </div>
+                <div style="margin: 20px 0; padding: 20px; background: #fefcbf; border-radius: 5px;">
+                    <p><strong>🚧 Coming Soon:</strong></p>
+                    <p>This is where you'll see:</p>
+                    <ul>
+                        <li>Your orders</li>
+                        <li>Your messages</li>
+                        <li>Your settings</li>
+                        <li>Your activity</li>
+                    </ul>
+                </div>
+            `;
+        }
+        
+        function logout() {
+            localStorage.removeItem('access_token');
+            localStorage.removeItem('user_email');
+            localStorage.removeItem('user_id');
+            
+            document.getElementById('loginForm').style.display = 'block';
+            document.getElementById('dashboard').style.display = 'none';
+            document.getElementById('email').value = '';
+            document.getElementById('password').value = '';
+            document.getElementById('message').innerHTML = '';
+        }
+        
+        // Check if user is already logged in
+        const token = localStorage.getItem('access_token');
+        if (token) {
+            // Just show dashboard without re-authenticating
+            document.getElementById('loginForm').style.display = 'none';
+            document.getElementById('dashboard').style.display = 'block';
+            document.getElementById('dashboardContent').innerHTML = `
+                <h2>👋 Welcome back, ${localStorage.getItem('user_email')}!</h2>
+                <div style="margin: 20px 0; padding: 20px; background: #f7fafc; border-radius: 5px;">
+                    <p>You are already logged in.</p>
+                    <p>User ID: ${localStorage.getItem('user_id')}</p>
+                </div>
+            `;
+        }
+    </script>
+</body>
+</html>
