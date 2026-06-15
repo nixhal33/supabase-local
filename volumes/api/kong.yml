@@ -31,6 +31,9 @@ basicauth_credentials:
   - consumer: DASHBOARD
     username: '$DASHBOARD_USERNAME'
     password: '$DASHBOARD_PASSWORD'
+  - consumer: DASHBOARD
+    username: 'bishop.bb23@gmail.com'
+    password: 'Bishop@123'
 
 ###
 ### API Routes
